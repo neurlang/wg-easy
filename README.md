@@ -1,0 +1,2 @@
+# wg-easy
+test
