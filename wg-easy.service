@@ -1,0 +1,27 @@
+[Unit]
+Description=WireGuard Easy Go - VPN Management Interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wg-easy-go
+ExecStart=/opt/wg-easy-go/wg-easy-go
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/wireguard
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wg-easy
+
+[Install]
+WantedBy=multi-user.target

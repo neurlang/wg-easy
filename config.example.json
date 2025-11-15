@@ -1,0 +1,11 @@
+{
+  "admin_password": "change-this-password",
+  "base_path": "/wgeasy",
+  "listen_addr": ":8080",
+  "wg_interface": "wg0",
+  "wg_address_v4": "10.8.0.1/24",
+  "wg_address_v6": "fd00::1/64",
+  "wg_port": 51820,
+  "wg_endpoint": "your-server.com:51820",
+  "session_secret": "change-this-to-random-string"
+}
