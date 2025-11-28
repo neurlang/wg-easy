@@ -47,6 +47,24 @@ func NewPortForwardServer(config *Config) *PortForwardServer {
 		pfs.externalIP = host
 	}
 
+	// Resolve domain to IP if needed
+	if ip := net.ParseIP(pfs.externalIP); ip == nil {
+		// It's a domain name, resolve it
+		ips, err := net.LookupIP(pfs.externalIP)
+		if err != nil {
+			log.Printf("Warning: Failed to resolve domain %s: %v", pfs.externalIP, err)
+		} else if len(ips) > 0 {
+			// Use first IPv4 address
+			for _, ip := range ips {
+				if ip4 := ip.To4(); ip4 != nil {
+					pfs.externalIP = ip4.String()
+					log.Printf("Resolved %s to %s", config.WgEndpoint, pfs.externalIP)
+					break
+				}
+			}
+		}
+	}
+
 	// Start NAT-PMP server
 	if err := pfs.startNATPMPServer(); err != nil {
 		log.Printf("Failed to start NAT-PMP server: %v", err)
