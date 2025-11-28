@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -14,19 +15,20 @@ import (
 )
 
 type WireGuardClient struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	PublicKey   string `json:"public_key"`
-	PrivateKey  string `json:"private_key"`
-	AddressV4   string `json:"address_v4"`
-	AddressV6   string `json:"address_v6"`
-	CreatedAt   string `json:"created_at"`
-	Enabled     bool   `json:"enabled"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	PublicKey  string `json:"public_key"`
+	PrivateKey string `json:"private_key"`
+	AddressV4  string `json:"address_v4"`
+	AddressV6  string `json:"address_v6"`
+	CreatedAt  string `json:"created_at"`
+	Enabled    bool   `json:"enabled"`
 }
 
 type WireGuardManager struct {
 	config  *Config
 	clients map[string]*WireGuardClient
+	pf      *PortForwardManager
 	mu      sync.RWMutex
 	nextIP  int
 }
@@ -37,6 +39,10 @@ func NewWireGuardManager(config *Config) *WireGuardManager {
 		clients: make(map[string]*WireGuardClient),
 		nextIP:  2, // Start from .2 (server is .1)
 	}
+}
+
+func (wm *WireGuardManager) SetPortForwardManager(pf *PortForwardManager) {
+	wm.pf = pf
 }
 
 func generatePrivateKey() (string, error) {
@@ -120,6 +126,13 @@ func (wm *WireGuardManager) DeleteClient(id string) error {
 		return err
 	}
 
+	// Clean up port forwards for this client
+	if wm.pf != nil {
+		if err := wm.pf.RemoveAllClientMappings(id); err != nil {
+			log.Printf("Warning: Failed to clean up port forwards for client %s: %v", id, err)
+		}
+	}
+
 	delete(wm.clients, id)
 	return nil
 }
@@ -147,14 +160,14 @@ func (wm *WireGuardManager) GetClient(id string) (*WireGuardClient, error) {
 }
 
 func (wm *WireGuardManager) addPeer(client *WireGuardClient) error {
-	allowedIPs := fmt.Sprintf("%s,%s", 
+	allowedIPs := fmt.Sprintf("%s,%s",
 		strings.TrimSuffix(client.AddressV4, "/32"),
 		strings.TrimSuffix(client.AddressV6, "/128"))
 
 	cmd := exec.Command("wg", "set", wm.config.WgInterface,
 		"peer", client.PublicKey,
 		"allowed-ips", allowedIPs)
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to add peer: %v - %s", err, string(output))
@@ -166,7 +179,7 @@ func (wm *WireGuardManager) addPeer(client *WireGuardClient) error {
 func (wm *WireGuardManager) removePeer(client *WireGuardClient) error {
 	cmd := exec.Command("wg", "set", wm.config.WgInterface,
 		"peer", client.PublicKey, "remove")
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to remove peer: %v - %s", err, string(output))
@@ -221,7 +234,7 @@ func (wm *WireGuardManager) EnsureInterface() error {
 
 	// Create WireGuard config file
 	configPath := fmt.Sprintf("/etc/wireguard/%s.conf", wm.config.WgInterface)
-	
+
 	privateKey, err := generatePrivateKey()
 	if err != nil {
 		return err

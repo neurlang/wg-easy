@@ -30,8 +30,15 @@ func main() {
 		log.Printf("Make sure WireGuard is installed and you have root privileges")
 	}
 
+	// Initialize port forward manager
+	pfManager := NewPortForwardManager(config)
+	defer pfManager.Cleanup()
+
+	// Link managers
+	wgManager.SetPortForwardManager(pfManager)
+
 	// Initialize server
-	server := NewServer(config, wgManager)
+	server := NewServer(config, wgManager, pfManager)
 
 	// Setup router
 	r := mux.NewRouter()
@@ -48,9 +55,16 @@ func main() {
 	r.HandleFunc(basePath+"/clients/create", server.requireAuth(server.handleCreateClient)).Methods("POST")
 	r.HandleFunc(basePath+"/clients/{id}/delete", server.requireAuth(server.handleDeleteClient)).Methods("POST")
 	r.HandleFunc(basePath+"/clients/{id}/config", server.requireAuth(server.handleDownloadConfig)).Methods("GET")
-	
+
+	// Port forwarding routes
+	r.HandleFunc(basePath+"/clients/{id}/portforwards", server.requireAuth(server.handlePortForwards)).Methods("GET")
+	r.HandleFunc(basePath+"/clients/{id}/portforwards/add", server.requireAuth(server.handleAddPortForward)).Methods("POST")
+	r.HandleFunc(basePath+"/clients/{id}/portforwards/{port}/{protocol}/delete", server.requireAuth(server.handleDeletePortForward)).Methods("POST")
+
 	// API routes
 	r.HandleFunc(basePath+"/api/clients", server.requireAuth(server.handleAPIClients)).Methods("GET")
+	r.HandleFunc(basePath+"/api/clients/{id}/portforwards", server.requireAuth(server.handleAPIPortForwards)).Methods("GET")
+	r.HandleFunc(basePath+"/api/portforwards", server.requireAuth(server.handleAPIAllPortForwards)).Methods("GET")
 
 	// Redirect root to base path if base path is set
 	if basePath != "" {

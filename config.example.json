@@ -7,5 +7,10 @@
   "wg_address_v6": "fd00::1/64",
   "wg_port": 51820,
   "wg_endpoint": "your-server.com:51820",
-  "session_secret": "change-this-to-random-string"
+  "session_secret": "change-this-to-random-string",
+  "port_forward_enabled": true,
+  "port_forward_min_port": 1024,
+  "port_forward_max_port": 65535,
+  "port_forward_max_per_client": 10,
+  "port_forward_lifetime": 3600
 }

@@ -19,6 +19,7 @@ The original wg-easy doesn't work properly when hosted behind nginx in a subdire
 - 👥 Create/delete WireGuard clients
 - 🌐 IPv4 and IPv6 dual-stack support
 - 📱 Download client configuration files
+- 🔌 **UPnP/NAT-PMP port forwarding** - Clients can request port forwards through the VPN
 - 🎨 Simple, functional HTML interface
 - 🔄 Nginx reverse proxy support (subdir or root)
 - 🐳 Docker support
@@ -42,9 +43,16 @@ Create `config.json`:
   "wg_address_v4": "10.8.0.1/24",
   "wg_address_v6": "fd00::1/64",
   "wg_port": 51820,
-  "wg_endpoint": "your-server.com:51820"
+  "wg_endpoint": "your-server.com:51820",
+  "port_forward_enabled": true,
+  "port_forward_min_port": 1024,
+  "port_forward_max_port": 65535,
+  "port_forward_max_per_client": 10,
+  "port_forward_lifetime": 3600
 }
 ```
+
+See [PORT_FORWARDING.md](PORT_FORWARDING.md) for detailed port forwarding documentation.
 
 ## Usage
 
