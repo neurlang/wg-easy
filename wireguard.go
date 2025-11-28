@@ -128,7 +128,11 @@ func (wm *WireGuardManager) DeleteClient(id string) error {
 
 	// Clean up port forwards for this client
 	if wm.pf != nil {
-		clientIP := strings.TrimSuffix(client.AddressV4, "/32")
+		// Extract IP from CIDR notation
+		clientIP := client.AddressV4
+		if ip, _, err := net.ParseCIDR(client.AddressV4); err == nil {
+			clientIP = ip.String()
+		}
 		if err := wm.pf.RemoveAllClientMappings(clientIP); err != nil {
 			log.Printf("Warning: Failed to clean up port forwards for client %s: %v", id, err)
 		}

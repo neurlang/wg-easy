@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -302,7 +304,11 @@ func (s *Server) handlePortForwards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+	// Extract IP from CIDR notation (e.g., "10.8.0.2/32" -> "10.8.0.2")
+	clientIP := client.AddressV4
+	if ip, _, err := net.ParseCIDR(client.AddressV4); err == nil {
+		clientIP = ip.String()
+	}
 	mappings := s.pf.GetClientMappings(clientIP)
 
 	s.renderPortForwards(w, client, mappings, s.config.WgEndpoint, "")
@@ -330,7 +336,11 @@ func (s *Server) handleDeletePortForward(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+	// Extract IP from CIDR notation
+	clientIP := client.AddressV4
+	if ip, _, err := net.ParseCIDR(client.AddressV4); err == nil {
+		clientIP = ip.String()
+	}
 
 	var port uint16
 	if _, err := fmt.Sscanf(externalPort, "%d", &port); err != nil {
@@ -356,7 +366,11 @@ func (s *Server) handleAPIPortForwards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+	// Extract IP from CIDR notation
+	clientIP := client.AddressV4
+	if ip, _, err := net.ParseCIDR(client.AddressV4); err == nil {
+		clientIP = ip.String()
+	}
 	mappings := s.pf.GetClientMappings(clientIP)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(mappings)
@@ -449,7 +463,7 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
             {{range .Mappings}}
             <tr>
                 <td><strong>{{.ExternalPort}}</strong></td>
-                <td class="code">{{.InternalIP}}:{{.InternalPort}}</td>
+                <td class="code">{{.ClientIP}}:{{.InternalPort}}</td>
                 <td>{{.Protocol | upper}}</td>
                 <td>{{.Description}}</td>
                 <td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
@@ -479,7 +493,7 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
 
 	t := template.Must(template.New("portforwards").Funcs(template.FuncMap{
 		"upper": func(s string) string {
-			return fmt.Sprintf("%s", s)
+			return strings.ToUpper(s)
 		},
 		"trimCIDR": func(s string) string {
 			if len(s) > 3 {

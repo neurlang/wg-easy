@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -84,9 +85,19 @@ func NewPortForwardServer(config *Config) *PortForwardServer {
 
 func (pfs *PortForwardServer) startNATPMPServer() error {
 	// NAT-PMP listens on port 5351
+	// Parse IP address from CIDR notation (e.g., "10.8.0.1/24" -> "10.8.0.1")
+	ipStr := pfs.config.WgAddressV4
+	if ip, _, err := net.ParseCIDR(pfs.config.WgAddressV4); err == nil {
+		ipStr = ip.String()
+	}
+
 	addr := &net.UDPAddr{
-		IP:   net.ParseIP(pfs.config.WgAddressV4[:len(pfs.config.WgAddressV4)-3]), // Remove /24
+		IP:   net.ParseIP(ipStr),
 		Port: 5351,
+	}
+
+	if addr.IP == nil {
+		return fmt.Errorf("invalid VPN address: %s", pfs.config.WgAddressV4)
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
@@ -323,19 +334,56 @@ func (pfs *PortForwardServer) addIPTablesRule(clientIP string, externalPort, int
 
 	log.Printf("Adding iptables rules for %s:%d -> %s:%d", protocol, externalPort, clientIP, internalPort)
 
-	// Execute iptables commands (commented out for safety - uncomment when ready)
-	// exec.Command("iptables", dnatArgs...).Run()
-	// exec.Command("iptables", forwardArgs...).Run()
+	// Execute DNAT rule
+	cmd := exec.Command("iptables", dnatArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add DNAT rule: %v - %s", err, string(output))
+	}
 
-	_ = dnatArgs
-	_ = forwardArgs
+	// Execute FORWARD rule
+	cmd = exec.Command("iptables", forwardArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Try to remove the DNAT rule we just added
+		pfs.removeIPTablesRule(clientIP, externalPort, internalPort, protocol)
+		return fmt.Errorf("failed to add FORWARD rule: %v - %s", err, string(output))
+	}
 
 	return nil
 }
 
 func (pfs *PortForwardServer) removeIPTablesRule(clientIP string, externalPort, internalPort uint16, protocol string) error {
 	log.Printf("Removing iptables rules for %s:%d -> %s:%d", protocol, externalPort, clientIP, internalPort)
-	return nil // Placeholder
+
+	// Remove DNAT rule
+	dnatArgs := []string{
+		"-t", "nat",
+		"-D", "PREROUTING",
+		"-p", protocol,
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT",
+		"--to-destination", fmt.Sprintf("%s:%d", clientIP, internalPort),
+	}
+
+	cmd := exec.Command("iptables", dnatArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: Failed to remove DNAT rule: %v - %s", err, string(output))
+	}
+
+	// Remove FORWARD rule
+	forwardArgs := []string{
+		"-D", "FORWARD",
+		"-p", protocol,
+		"-d", clientIP,
+		"--dport", fmt.Sprintf("%d", internalPort),
+		"-j", "ACCEPT",
+	}
+
+	cmd = exec.Command("iptables", forwardArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: Failed to remove FORWARD rule: %v - %s", err, string(output))
+	}
+
+	return nil
 }
 
 func (pfs *PortForwardServer) cleanupExpiredMappings() {
