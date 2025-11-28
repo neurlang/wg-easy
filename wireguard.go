@@ -28,7 +28,7 @@ type WireGuardClient struct {
 type WireGuardManager struct {
 	config  *Config
 	clients map[string]*WireGuardClient
-	pf      *PortForwardManager
+	pf      *PortForwardServer
 	mu      sync.RWMutex
 	nextIP  int
 }
@@ -41,7 +41,7 @@ func NewWireGuardManager(config *Config) *WireGuardManager {
 	}
 }
 
-func (wm *WireGuardManager) SetPortForwardManager(pf *PortForwardManager) {
+func (wm *WireGuardManager) SetPortForwardServer(pf *PortForwardServer) {
 	wm.pf = pf
 }
 
@@ -128,7 +128,8 @@ func (wm *WireGuardManager) DeleteClient(id string) error {
 
 	// Clean up port forwards for this client
 	if wm.pf != nil {
-		if err := wm.pf.RemoveAllClientMappings(id); err != nil {
+		clientIP := strings.TrimSuffix(client.AddressV4, "/32")
+		if err := wm.pf.RemoveAllClientMappings(clientIP); err != nil {
 			log.Printf("Warning: Failed to clean up port forwards for client %s: %v", id, err)
 		}
 	}

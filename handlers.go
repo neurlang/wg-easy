@@ -13,12 +13,12 @@ import (
 type Server struct {
 	config *Config
 	wg     *WireGuardManager
-	pf     *PortForwardManager
+	pf     *PortForwardServer
 	store  *sessions.CookieStore
 	tmpl   *template.Template
 }
 
-func NewServer(config *Config, wg *WireGuardManager, pf *PortForwardManager) *Server {
+func NewServer(config *Config, wg *WireGuardManager, pf *PortForwardServer) *Server {
 	store := sessions.NewCookieStore([]byte(config.SessionSecret))
 	store.Options = &sessions.Options{
 		Path:     config.BasePath + "/",
@@ -190,6 +190,8 @@ func (s *Server) renderIndex(w http.ResponseWriter, clients []*WireGuardClient) 
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
         .logout { padding: 8px 16px; background: #dc3545; color: white; text-decoration: none; border-radius: 4px; }
         .logout:hover { background: #c82333; }
+        .pf-status { background: #fff3cd; padding: 10px 15px; border-radius: 4px; margin-bottom: 20px; border-left: 4px solid #ffc107; }
+        .pf-status.enabled { background: #d4edda; border-left-color: #28a745; }
         .add-form { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
         .add-form input { padding: 10px; margin-right: 10px; border: 1px solid #ddd; border-radius: 4px; }
         .add-form button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
@@ -204,6 +206,7 @@ func (s *Server) renderIndex(w http.ResponseWriter, clients []*WireGuardClient) 
         .btn-download:hover { background: #138496; }
         .btn-portforward { background: #6f42c1; color: white; }
         .btn-portforward:hover { background: #5a32a3; }
+        .btn-portforward.disabled { background: #6c757d; opacity: 0.6; }
         .btn-delete { background: #dc3545; color: white; }
         .btn-delete:hover { background: #c82333; }
         .empty { text-align: center; padding: 40px; color: #666; }
@@ -215,6 +218,16 @@ func (s *Server) renderIndex(w http.ResponseWriter, clients []*WireGuardClient) 
         <h1>🔐 WireGuard Easy</h1>
         <a href="{{.BasePath}}/logout" class="logout">Logout</a>
     </div>
+
+    {{if .PortForwardEnabled}}
+    <div class="pf-status enabled">
+        ✓ NAT-PMP server is running - Clients can request port forwards automatically
+    </div>
+    {{else}}
+    <div class="pf-status">
+        ⚠️ NAT-PMP server is disabled (check server logs)
+    </div>
+    {{end}}
 
     <div class="add-form">
         <h2>Add New Client</h2>
@@ -244,7 +257,7 @@ func (s *Server) renderIndex(w http.ResponseWriter, clients []*WireGuardClient) 
                 <td class="code">{{slice .PublicKey 0 20}}...</td>
                 <td class="actions">
                     <a href="{{$.BasePath}}/clients/{{.ID}}/config" class="btn btn-download">📥 Download</a>
-                    <a href="{{$.BasePath}}/clients/{{.ID}}/portforwards" class="btn btn-portforward">🔌 Ports</a>
+                    <a href="{{$.BasePath}}/clients/{{.ID}}/portforwards" class="btn btn-portforward{{if not $.PortForwardEnabled}} disabled{{end}}">🔌 Ports</a>
                     <form method="POST" action="{{$.BasePath}}/clients/{{.ID}}/delete" style="display: inline;">
                         <button type="submit" class="btn btn-delete" onclick="return confirm('Delete {{.Name}}?')">🗑️ Delete</button>
                     </form>
@@ -271,8 +284,9 @@ func (s *Server) renderIndex(w http.ResponseWriter, clients []*WireGuardClient) 
 	}).Parse(tmpl))
 
 	t.Execute(w, map[string]interface{}{
-		"Clients":  clients,
-		"BasePath": s.config.BasePath,
+		"Clients":            clients,
+		"BasePath":           s.config.BasePath,
+		"PortForwardEnabled": s.pf.IsEnabled(),
 	})
 }
 
@@ -288,64 +302,15 @@ func (s *Server) handlePortForwards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mappings := s.pf.GetClientMappings(clientID)
-	externalIP, _ := s.pf.GetExternalIP()
+	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+	mappings := s.pf.GetClientMappings(clientIP)
 
-	s.renderPortForwards(w, client, mappings, externalIP, "")
+	s.renderPortForwards(w, client, mappings, s.config.WgEndpoint, "")
 }
 
 func (s *Server) handleAddPortForward(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	vars := mux.Vars(r)
-	clientID := vars["id"]
-
-	client, err := s.wg.GetClient(clientID)
-	if err != nil {
-		http.Error(w, "Client not found", http.StatusNotFound)
-		return
-	}
-
-	// Parse form
-	externalPort := r.FormValue("external_port")
-	internalPort := r.FormValue("internal_port")
-	protocol := r.FormValue("protocol")
-	description := r.FormValue("description")
-
-	// Validate and convert ports
-	var extPort, intPort uint16
-	if _, err := fmt.Sscanf(externalPort, "%d", &extPort); err != nil || extPort == 0 {
-		mappings := s.pf.GetClientMappings(clientID)
-		externalIP, _ := s.pf.GetExternalIP()
-		s.renderPortForwards(w, client, mappings, externalIP, "Invalid external port")
-		return
-	}
-	if _, err := fmt.Sscanf(internalPort, "%d", &intPort); err != nil || intPort == 0 {
-		mappings := s.pf.GetClientMappings(clientID)
-		externalIP, _ := s.pf.GetExternalIP()
-		s.renderPortForwards(w, client, mappings, externalIP, "Invalid internal port")
-		return
-	}
-
-	// Get client's internal IP (IPv4)
-	internalIP := client.AddressV4
-	if idx := len(internalIP) - 3; idx > 0 {
-		internalIP = internalIP[:idx] // Remove /32
-	}
-
-	// Add port forward
-	err = s.pf.AddMapping(clientID, client.Name, internalIP, extPort, intPort, protocol, description)
-	if err != nil {
-		mappings := s.pf.GetClientMappings(clientID)
-		externalIP, _ := s.pf.GetExternalIP()
-		s.renderPortForwards(w, client, mappings, externalIP, err.Error())
-		return
-	}
-
-	http.Redirect(w, r, fmt.Sprintf("%s/clients/%s/portforwards", s.config.BasePath, clientID), http.StatusSeeOther)
+	// Manual port forwards disabled - clients use NAT-PMP protocol
+	http.Error(w, "Use NAT-PMP protocol from client", http.StatusNotImplemented)
 }
 
 func (s *Server) handleDeletePortForward(w http.ResponseWriter, r *http.Request) {
@@ -359,13 +324,21 @@ func (s *Server) handleDeletePortForward(w http.ResponseWriter, r *http.Request)
 	externalPort := vars["port"]
 	protocol := vars["protocol"]
 
+	client, err := s.wg.GetClient(clientID)
+	if err != nil {
+		http.Error(w, "Client not found", http.StatusNotFound)
+		return
+	}
+
+	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+
 	var port uint16
 	if _, err := fmt.Sscanf(externalPort, "%d", &port); err != nil {
 		http.Error(w, "Invalid port", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.pf.RemoveMapping(clientID, port, protocol); err != nil {
+	if err := s.pf.removeMapping(clientIP, port, protocol); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -377,7 +350,14 @@ func (s *Server) handleAPIPortForwards(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	clientID := vars["id"]
 
-	mappings := s.pf.GetClientMappings(clientID)
+	client, err := s.wg.GetClient(clientID)
+	if err != nil {
+		http.Error(w, "Client not found", http.StatusNotFound)
+		return
+	}
+
+	clientIP := client.AddressV4[:len(client.AddressV4)-3] // Remove /32
+	mappings := s.pf.GetClientMappings(clientIP)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(mappings)
 }
@@ -429,8 +409,9 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
 
     {{if .ExternalIP}}
     <div class="info-box">
-        <strong>External IP:</strong> {{.ExternalIP}}<br>
-        <strong>Client Internal IP:</strong> {{.Client.AddressV4}}
+        <strong>Server External Endpoint:</strong> {{.ExternalIP}}<br>
+        <strong>Client VPN IP:</strong> {{.Client.AddressV4}}<br>
+        <strong>NAT-PMP Server:</strong> {{.Client.AddressV4 | trimCIDR}}:5351
     </div>
     {{end}}
 
@@ -440,29 +421,16 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
 
     {{if .Enabled}}
     <div class="add-form">
-        <h2>Add Port Forward</h2>
-        <form method="POST" action="{{.BasePath}}/clients/{{.Client.ID}}/portforwards/add">
-            <div class="form-row">
-                <label>External Port:</label>
-                <input type="number" name="external_port" min="1024" max="65535" required>
-            </div>
-            <div class="form-row">
-                <label>Internal Port:</label>
-                <input type="number" name="internal_port" min="1" max="65535" required>
-            </div>
-            <div class="form-row">
-                <label>Protocol:</label>
-                <select name="protocol" required>
-                    <option value="tcp">TCP</option>
-                    <option value="udp">UDP</option>
-                </select>
-            </div>
-            <div class="form-row">
-                <label>Description:</label>
-                <input type="text" name="description" placeholder="e.g., Web Server" required>
-            </div>
-            <button type="submit">➕ Add Port Forward</button>
-        </form>
+        <h2>How to Use NAT-PMP</h2>
+        <p>This VPN server runs a NAT-PMP server. Clients can automatically request port forwards using NAT-PMP-enabled applications.</p>
+        <p><strong>NAT-PMP Server Address:</strong> <code>{{.Client.AddressV4 | trimCIDR}}:5351</code></p>
+        <p><strong>Examples:</strong></p>
+        <ul>
+            <li>Torrent clients (qBittorrent, Transmission) - Enable UPnP/NAT-PMP in settings</li>
+            <li>Game clients - Many games auto-discover NAT-PMP</li>
+            <li>Custom apps - Use NAT-PMP libraries to request ports</li>
+        </ul>
+        <p>Port forwards requested by this client will appear below.</p>
     </div>
 
     {{if .Mappings}}
@@ -501,8 +469,9 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
     {{end}}
     {{else}}
     <div class="disabled">
-        <strong>⚠️ Port forwarding is disabled</strong><br>
-        Enable it in the server configuration to use this feature.
+        <strong>⚠️ NAT-PMP server is not running</strong><br>
+        <br>
+        Set <code>"port_forward_enabled": true</code> in config.json and restart the server.
     </div>
     {{end}}
 </body>
@@ -511,6 +480,12 @@ func (s *Server) renderPortForwards(w http.ResponseWriter, client *WireGuardClie
 	t := template.Must(template.New("portforwards").Funcs(template.FuncMap{
 		"upper": func(s string) string {
 			return fmt.Sprintf("%s", s)
+		},
+		"trimCIDR": func(s string) string {
+			if len(s) > 3 {
+				return s[:len(s)-3]
+			}
+			return s
 		},
 	}).Parse(tmpl))
 

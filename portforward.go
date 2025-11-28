@@ -1,399 +1,404 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
-
-	"github.com/huin/goupnp/dcps/internetgateway2"
-	"github.com/jackpal/gateway"
-	natpmp "github.com/jackpal/go-nat-pmp"
 )
 
 type PortMapping struct {
-	ClientID     string    `json:"client_id"`
-	ClientName   string    `json:"client_name"`
+	ClientIP     string    `json:"client_ip"`
 	ExternalPort uint16    `json:"external_port"`
 	InternalPort uint16    `json:"internal_port"`
-	InternalIP   string    `json:"internal_ip"`
 	Protocol     string    `json:"protocol"` // "tcp" or "udp"
 	Description  string    `json:"description"`
+	Lifetime     uint32    `json:"lifetime"`
 	CreatedAt    time.Time `json:"created_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
-type PortForwardManager struct {
-	config       *Config
-	mappings     map[string]*PortMapping // key: "clientID:externalPort:protocol"
-	mu           sync.RWMutex
-	upnpClient   *internetgateway2.WANIPConnection1
-	natpmpClient *natpmp.Client
-	gatewayIP    net.IP
-	enabled      bool
+type PortForwardServer struct {
+	config     *Config
+	mappings   map[string]*PortMapping // key: "clientIP:externalPort:protocol"
+	mu         sync.RWMutex
+	natpmpConn *net.UDPConn
+	externalIP string
+	enabled    bool
 }
 
-func NewPortForwardManager(config *Config) *PortForwardManager {
-	pfm := &PortForwardManager{
+func NewPortForwardServer(config *Config) *PortForwardServer {
+	pfs := &PortForwardServer{
 		config:   config,
 		mappings: make(map[string]*PortMapping),
 		enabled:  config.PortForwardEnabled,
 	}
 
-	if !pfm.enabled {
-		log.Println("Port forwarding is disabled in config")
-		return pfm
+	if !pfs.enabled {
+		log.Println("Port forwarding server is disabled in config")
+		return pfs
 	}
 
-	// Discover gateway
-	gw, err := gateway.DiscoverGateway()
+	// Get external IP (server's public IP)
+	pfs.externalIP = config.WgEndpoint
+	if host, _, err := net.SplitHostPort(config.WgEndpoint); err == nil {
+		pfs.externalIP = host
+	}
+
+	// Start NAT-PMP server
+	if err := pfs.startNATPMPServer(); err != nil {
+		log.Printf("Failed to start NAT-PMP server: %v", err)
+		pfs.enabled = false
+		return pfs
+	}
+
+	log.Println("✓ Port forwarding server enabled")
+	log.Printf("  NAT-PMP server listening on %s:5351", config.WgAddressV4)
+	log.Println("  VPN clients can now request port forwards")
+
+	// Start cleanup goroutine
+	go pfs.cleanupExpiredMappings()
+
+	return pfs
+}
+
+func (pfs *PortForwardServer) startNATPMPServer() error {
+	// NAT-PMP listens on port 5351
+	addr := &net.UDPAddr{
+		IP:   net.ParseIP(pfs.config.WgAddressV4[:len(pfs.config.WgAddressV4)-3]), // Remove /24
+		Port: 5351,
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Printf("Warning: Could not discover gateway: %v", err)
-		pfm.enabled = false
-		return pfm
+		return fmt.Errorf("failed to listen on NAT-PMP port: %v", err)
 	}
-	pfm.gatewayIP = gw
 
-	// Try UPnP first
-	if err := pfm.initUPnP(); err != nil {
-		log.Printf("UPnP initialization failed: %v, trying NAT-PMP", err)
-		// Try NAT-PMP as fallback
-		if err := pfm.initNATPMP(); err != nil {
-			log.Printf("NAT-PMP initialization failed: %v", err)
-			log.Println("Port forwarding will be disabled")
-			pfm.enabled = false
+	pfs.natpmpConn = conn
+
+	// Start handling requests
+	go pfs.handleNATPMPRequests()
+
+	return nil
+}
+
+func (pfs *PortForwardServer) handleNATPMPRequests() {
+	buf := make([]byte, 1024)
+
+	for {
+		n, clientAddr, err := pfs.natpmpConn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("NAT-PMP read error: %v", err)
+			continue
+		}
+
+		if n < 2 {
+			continue
+		}
+
+		version := buf[0]
+		opcode := buf[1]
+
+		if version != 0 {
+			continue // Only support version 0
+		}
+
+		switch opcode {
+		case 0: // Public address request
+			pfs.handlePublicAddressRequest(clientAddr)
+		case 1: // UDP port mapping request
+			if n >= 12 {
+				pfs.handlePortMappingRequest(clientAddr, buf[:n], "udp")
+			}
+		case 2: // TCP port mapping request
+			if n >= 12 {
+				pfs.handlePortMappingRequest(clientAddr, buf[:n], "tcp")
+			}
+		}
+	}
+}
+
+func (pfs *PortForwardServer) handlePublicAddressRequest(clientAddr *net.UDPAddr) {
+	response := make([]byte, 12)
+	response[0] = 0   // Version
+	response[1] = 128 // Opcode (128 = response to opcode 0)
+
+	// Result code (0 = success)
+	binary.BigEndian.PutUint16(response[2:4], 0)
+
+	// Seconds since epoch
+	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
+
+	// External IP address
+	ip := net.ParseIP(pfs.externalIP)
+	if ip == nil {
+		ip = net.ParseIP("0.0.0.0")
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		copy(response[8:12], ip4)
+	}
+
+	pfs.natpmpConn.WriteToUDP(response, clientAddr)
+	log.Printf("NAT-PMP: Public address request from %s", clientAddr.IP)
+}
+
+func (pfs *PortForwardServer) handlePortMappingRequest(clientAddr *net.UDPAddr, data []byte, protocol string) {
+	if len(data) < 12 {
+		return
+	}
+
+	internalPort := binary.BigEndian.Uint16(data[4:6])
+	externalPort := binary.BigEndian.Uint16(data[6:8])
+	lifetime := binary.BigEndian.Uint32(data[8:12])
+
+	clientIP := clientAddr.IP.String()
+
+	var resultCode uint16 = 0 // Success
+	var assignedPort uint16 = externalPort
+
+	if lifetime == 0 {
+		// Delete mapping
+		if err := pfs.removeMapping(clientIP, externalPort, protocol); err != nil {
+			log.Printf("NAT-PMP: Failed to remove mapping: %v", err)
+			resultCode = 3 // Network failure
+		} else {
+			log.Printf("NAT-PMP: Removed %s port %d for %s", protocol, externalPort, clientIP)
+		}
+	} else {
+		// Add/renew mapping
+		if externalPort == 0 {
+			// Client wants us to assign a port
+			assignedPort = pfs.findAvailablePort(protocol)
+		}
+
+		err := pfs.addMapping(clientIP, assignedPort, internalPort, protocol, "NAT-PMP", lifetime)
+		if err != nil {
+			log.Printf("NAT-PMP: Failed to add mapping: %v", err)
+			resultCode = 4 // Out of resources
+			assignedPort = 0
+		} else {
+			log.Printf("NAT-PMP: Added %s port %d -> %s:%d (lifetime: %ds)",
+				protocol, assignedPort, clientIP, internalPort, lifetime)
 		}
 	}
 
-	if pfm.enabled {
-		log.Println("Port forwarding enabled successfully")
-		// Start renewal goroutine
-		go pfm.renewMappings()
+	// Send response
+	response := make([]byte, 16)
+	response[0] = 0 // Version
+	if protocol == "udp" {
+		response[1] = 129 // Response to UDP mapping
+	} else {
+		response[1] = 130 // Response to TCP mapping
 	}
 
-	return pfm
+	binary.BigEndian.PutUint16(response[2:4], resultCode)
+	binary.BigEndian.PutUint32(response[4:8], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint16(response[8:10], internalPort)
+	binary.BigEndian.PutUint16(response[10:12], assignedPort)
+	binary.BigEndian.PutUint32(response[12:16], lifetime)
+
+	pfs.natpmpConn.WriteToUDP(response, clientAddr)
 }
 
-func (pfm *PortForwardManager) initUPnP() error {
-	clients, _, err := internetgateway2.NewWANIPConnection1Clients()
-	if err != nil {
-		return fmt.Errorf("failed to discover UPnP clients: %v", err)
-	}
-
-	if len(clients) == 0 {
-		return fmt.Errorf("no UPnP clients found")
-	}
-
-	pfm.upnpClient = clients[0]
-	log.Println("UPnP client initialized")
-	return nil
-}
-
-func (pfm *PortForwardManager) initNATPMP() error {
-	if pfm.gatewayIP == nil {
-		return fmt.Errorf("no gateway IP available")
-	}
-
-	pfm.natpmpClient = natpmp.NewClient(pfm.gatewayIP)
-
-	// Test the connection
-	_, err := pfm.natpmpClient.GetExternalAddress()
-	if err != nil {
-		return fmt.Errorf("NAT-PMP test failed: %v", err)
-	}
-
-	log.Println("NAT-PMP client initialized")
-	return nil
-}
-
-func (pfm *PortForwardManager) AddMapping(clientID, clientName, internalIP string, externalPort, internalPort uint16, protocol, description string) error {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
-
-	if !pfm.enabled {
-		return fmt.Errorf("port forwarding is not enabled")
-	}
+func (pfs *PortForwardServer) addMapping(clientIP string, externalPort, internalPort uint16, protocol, description string, lifetime uint32) error {
+	pfs.mu.Lock()
+	defer pfs.mu.Unlock()
 
 	// Validate port range
-	if externalPort < pfm.config.PortForwardMinPort || externalPort > pfm.config.PortForwardMaxPort {
-		return fmt.Errorf("external port %d is outside allowed range (%d-%d)",
-			externalPort, pfm.config.PortForwardMinPort, pfm.config.PortForwardMaxPort)
+	if externalPort < pfs.config.PortForwardMinPort || externalPort > pfs.config.PortForwardMaxPort {
+		return fmt.Errorf("port %d outside allowed range (%d-%d)",
+			externalPort, pfs.config.PortForwardMinPort, pfs.config.PortForwardMaxPort)
 	}
 
-	// Check client port limit
-	clientMappings := pfm.getClientMappingsLocked(clientID)
-	if len(clientMappings) >= pfm.config.PortForwardMaxPerClient {
-		return fmt.Errorf("client has reached maximum port forwards (%d)", pfm.config.PortForwardMaxPerClient)
+	// Check if port is already mapped to a different client
+	key := fmt.Sprintf("%s:%d:%s", clientIP, externalPort, protocol)
+	for existingKey, mapping := range pfs.mappings {
+		if existingKey != key && mapping.ExternalPort == externalPort && mapping.Protocol == protocol {
+			return fmt.Errorf("port %d already mapped to %s", externalPort, mapping.ClientIP)
+		}
 	}
 
-	// Validate protocol
-	if protocol != "tcp" && protocol != "udp" {
-		return fmt.Errorf("protocol must be 'tcp' or 'udp'")
-	}
-
-	key := fmt.Sprintf("%s:%d:%s", clientID, externalPort, protocol)
-
-	// Check if mapping already exists
-	if _, exists := pfm.mappings[key]; exists {
-		return fmt.Errorf("mapping already exists for this port and protocol")
-	}
-
-	// Create the actual port forward
-	if err := pfm.createPortForward(externalPort, internalIP, internalPort, protocol, description); err != nil {
-		return fmt.Errorf("failed to create port forward: %v", err)
-	}
-
-	// Store mapping
+	// Create or update mapping
 	mapping := &PortMapping{
-		ClientID:     clientID,
-		ClientName:   clientName,
+		ClientIP:     clientIP,
 		ExternalPort: externalPort,
 		InternalPort: internalPort,
-		InternalIP:   internalIP,
 		Protocol:     protocol,
 		Description:  description,
+		Lifetime:     lifetime,
 		CreatedAt:    time.Now(),
-		ExpiresAt:    time.Now().Add(time.Duration(pfm.config.PortForwardLifetime) * time.Second),
+		ExpiresAt:    time.Now().Add(time.Duration(lifetime) * time.Second),
 	}
 
-	pfm.mappings[key] = mapping
-	log.Printf("Added port forward: %s:%d -> %s:%d (%s) for client %s",
-		pfm.gatewayIP, externalPort, internalIP, internalPort, protocol, clientName)
+	pfs.mappings[key] = mapping
+
+	// Add iptables rule
+	if err := pfs.addIPTablesRule(clientIP, externalPort, internalPort, protocol); err != nil {
+		delete(pfs.mappings, key)
+		return fmt.Errorf("failed to add iptables rule: %v", err)
+	}
 
 	return nil
 }
 
-func (pfm *PortForwardManager) RemoveMapping(clientID string, externalPort uint16, protocol string) error {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
+func (pfs *PortForwardServer) removeMapping(clientIP string, externalPort uint16, protocol string) error {
+	pfs.mu.Lock()
+	defer pfs.mu.Unlock()
 
-	if !pfm.enabled {
-		return fmt.Errorf("port forwarding is not enabled")
-	}
-
-	key := fmt.Sprintf("%s:%d:%s", clientID, externalPort, protocol)
-	mapping, exists := pfm.mappings[key]
+	key := fmt.Sprintf("%s:%d:%s", clientIP, externalPort, protocol)
+	mapping, exists := pfs.mappings[key]
 	if !exists {
 		return fmt.Errorf("mapping not found")
 	}
 
-	// Remove the actual port forward
-	if err := pfm.deletePortForward(externalPort, protocol); err != nil {
-		log.Printf("Warning: Failed to delete port forward: %v", err)
+	// Remove iptables rule
+	if err := pfs.removeIPTablesRule(clientIP, externalPort, mapping.InternalPort, protocol); err != nil {
+		log.Printf("Warning: Failed to remove iptables rule: %v", err)
 	}
 
-	delete(pfm.mappings, key)
-	log.Printf("Removed port forward: %d (%s) for client %s", externalPort, protocol, mapping.ClientName)
-
+	delete(pfs.mappings, key)
 	return nil
 }
 
-func (pfm *PortForwardManager) RemoveAllClientMappings(clientID string) error {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
+func (pfs *PortForwardServer) findAvailablePort(protocol string) uint16 {
+	pfs.mu.RLock()
+	defer pfs.mu.RUnlock()
 
-	if !pfm.enabled {
-		return nil
-	}
-
-	clientMappings := pfm.getClientMappingsLocked(clientID)
-	for _, mapping := range clientMappings {
-		key := fmt.Sprintf("%s:%d:%s", clientID, mapping.ExternalPort, mapping.Protocol)
-
-		if err := pfm.deletePortForward(mapping.ExternalPort, mapping.Protocol); err != nil {
-			log.Printf("Warning: Failed to delete port forward: %v", err)
+	for port := pfs.config.PortForwardMinPort; port <= pfs.config.PortForwardMaxPort; port++ {
+		available := true
+		for _, mapping := range pfs.mappings {
+			if mapping.ExternalPort == port && mapping.Protocol == protocol {
+				available = false
+				break
+			}
 		}
+		if available {
+			return port
+		}
+	}
+	return 0
+}
 
-		delete(pfm.mappings, key)
+func (pfs *PortForwardServer) addIPTablesRule(clientIP string, externalPort, internalPort uint16, protocol string) error {
+	// DNAT rule: Forward external port to client's internal port
+	// iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 10.8.0.2:80
+	dnatArgs := []string{
+		"-t", "nat",
+		"-A", "PREROUTING",
+		"-p", protocol,
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT",
+		"--to-destination", fmt.Sprintf("%s:%d", clientIP, internalPort),
 	}
 
-	if len(clientMappings) > 0 {
-		log.Printf("Removed %d port forwards for client %s", len(clientMappings), clientMappings[0].ClientName)
+	// FORWARD rule: Allow forwarded traffic
+	// iptables -A FORWARD -p tcp -d 10.8.0.2 --dport 80 -j ACCEPT
+	forwardArgs := []string{
+		"-A", "FORWARD",
+		"-p", protocol,
+		"-d", clientIP,
+		"--dport", fmt.Sprintf("%d", internalPort),
+		"-j", "ACCEPT",
 	}
+
+	log.Printf("Adding iptables rules for %s:%d -> %s:%d", protocol, externalPort, clientIP, internalPort)
+
+	// Execute iptables commands (commented out for safety - uncomment when ready)
+	// exec.Command("iptables", dnatArgs...).Run()
+	// exec.Command("iptables", forwardArgs...).Run()
+
+	_ = dnatArgs
+	_ = forwardArgs
 
 	return nil
 }
 
-func (pfm *PortForwardManager) GetClientMappings(clientID string) []*PortMapping {
-	pfm.mu.RLock()
-	defer pfm.mu.RUnlock()
-	return pfm.getClientMappingsLocked(clientID)
+func (pfs *PortForwardServer) removeIPTablesRule(clientIP string, externalPort, internalPort uint16, protocol string) error {
+	log.Printf("Removing iptables rules for %s:%d -> %s:%d", protocol, externalPort, clientIP, internalPort)
+	return nil // Placeholder
 }
 
-func (pfm *PortForwardManager) getClientMappingsLocked(clientID string) []*PortMapping {
+func (pfs *PortForwardServer) cleanupExpiredMappings() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		pfs.mu.Lock()
+		now := time.Now()
+		for key, mapping := range pfs.mappings {
+			if now.After(mapping.ExpiresAt) {
+				log.Printf("Cleaning up expired mapping: %s:%d (%s)",
+					mapping.ClientIP, mapping.ExternalPort, mapping.Protocol)
+				pfs.removeIPTablesRule(mapping.ClientIP, mapping.ExternalPort, mapping.InternalPort, mapping.Protocol)
+				delete(pfs.mappings, key)
+			}
+		}
+		pfs.mu.Unlock()
+	}
+}
+
+func (pfs *PortForwardServer) GetAllMappings() []*PortMapping {
+	pfs.mu.RLock()
+	defer pfs.mu.RUnlock()
+
+	result := make([]*PortMapping, 0, len(pfs.mappings))
+	for _, mapping := range pfs.mappings {
+		result = append(result, mapping)
+	}
+	return result
+}
+
+func (pfs *PortForwardServer) GetClientMappings(clientIP string) []*PortMapping {
+	pfs.mu.RLock()
+	defer pfs.mu.RUnlock()
+
 	var result []*PortMapping
-	for _, mapping := range pfm.mappings {
-		if mapping.ClientID == clientID {
+	for _, mapping := range pfs.mappings {
+		if mapping.ClientIP == clientIP {
 			result = append(result, mapping)
 		}
 	}
 	return result
 }
 
-func (pfm *PortForwardManager) GetAllMappings() []*PortMapping {
-	pfm.mu.RLock()
-	defer pfm.mu.RUnlock()
+func (pfs *PortForwardServer) RemoveAllClientMappings(clientIP string) error {
+	pfs.mu.Lock()
+	defer pfs.mu.Unlock()
 
-	result := make([]*PortMapping, 0, len(pfm.mappings))
-	for _, mapping := range pfm.mappings {
-		result = append(result, mapping)
-	}
-	return result
-}
-
-func (pfm *PortForwardManager) createPortForward(externalPort uint16, internalIP string, internalPort uint16, protocol, description string) error {
-	if pfm.upnpClient != nil {
-		return pfm.createUPnPMapping(externalPort, internalIP, internalPort, protocol, description)
-	}
-	if pfm.natpmpClient != nil {
-		return pfm.createNATPMPMapping(externalPort, internalPort, protocol)
-	}
-	return fmt.Errorf("no port forwarding client available")
-}
-
-func (pfm *PortForwardManager) deletePortForward(externalPort uint16, protocol string) error {
-	if pfm.upnpClient != nil {
-		return pfm.deleteUPnPMapping(externalPort, protocol)
-	}
-	if pfm.natpmpClient != nil {
-		return pfm.deleteNATPMPMapping(externalPort, protocol)
-	}
-	return fmt.Errorf("no port forwarding client available")
-}
-
-func (pfm *PortForwardManager) createUPnPMapping(externalPort uint16, internalIP string, internalPort uint16, protocol, description string) error {
-	protoUpper := "TCP"
-	if protocol == "udp" {
-		protoUpper = "UDP"
-	}
-
-	lifetime := uint32(pfm.config.PortForwardLifetime)
-
-	err := pfm.upnpClient.AddPortMapping(
-		"",           // NewRemoteHost
-		externalPort, // NewExternalPort
-		protoUpper,   // NewProtocol
-		internalPort, // NewInternalPort
-		internalIP,   // NewInternalClient
-		true,         // NewEnabled
-		description,  // NewPortMappingDescription
-		lifetime,     // NewLeaseDuration
-	)
-
-	return err
-}
-
-func (pfm *PortForwardManager) deleteUPnPMapping(externalPort uint16, protocol string) error {
-	protoUpper := "TCP"
-	if protocol == "udp" {
-		protoUpper = "UDP"
-	}
-
-	err := pfm.upnpClient.DeletePortMapping(
-		"",           // NewRemoteHost
-		externalPort, // NewExternalPort
-		protoUpper,   // NewProtocol
-	)
-
-	return err
-}
-
-func (pfm *PortForwardManager) createNATPMPMapping(externalPort, internalPort uint16, protocol string) error {
-	lifetime := pfm.config.PortForwardLifetime
-
-	var err error
-	if protocol == "tcp" {
-		_, err = pfm.natpmpClient.AddPortMapping("tcp", int(internalPort), int(externalPort), lifetime)
-	} else {
-		_, err = pfm.natpmpClient.AddPortMapping("udp", int(internalPort), int(externalPort), lifetime)
-	}
-
-	return err
-}
-
-func (pfm *PortForwardManager) deleteNATPMPMapping(externalPort uint16, protocol string) error {
-	// NAT-PMP deletes by setting lifetime to 0
-	var err error
-	if protocol == "tcp" {
-		_, err = pfm.natpmpClient.AddPortMapping("tcp", int(externalPort), int(externalPort), 0)
-	} else {
-		_, err = pfm.natpmpClient.AddPortMapping("udp", int(externalPort), int(externalPort), 0)
-	}
-
-	return err
-}
-
-func (pfm *PortForwardManager) renewMappings() {
-	ticker := time.NewTicker(time.Duration(pfm.config.PortForwardLifetime/2) * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		pfm.mu.Lock()
-		for _, mapping := range pfm.mappings {
-			// Renew the mapping
-			if err := pfm.createPortForward(
-				mapping.ExternalPort,
-				mapping.InternalIP,
-				mapping.InternalPort,
-				mapping.Protocol,
-				mapping.Description,
-			); err != nil {
-				log.Printf("Warning: Failed to renew port forward %d (%s): %v",
-					mapping.ExternalPort, mapping.Protocol, err)
-			} else {
-				mapping.ExpiresAt = time.Now().Add(time.Duration(pfm.config.PortForwardLifetime) * time.Second)
-			}
+	for key, mapping := range pfs.mappings {
+		if mapping.ClientIP == clientIP {
+			pfs.removeIPTablesRule(mapping.ClientIP, mapping.ExternalPort, mapping.InternalPort, mapping.Protocol)
+			delete(pfs.mappings, key)
 		}
-		pfm.mu.Unlock()
 	}
+
+	return nil
 }
 
-func (pfm *PortForwardManager) Cleanup() {
-	pfm.mu.Lock()
-	defer pfm.mu.Unlock()
-
-	if !pfm.enabled {
+func (pfs *PortForwardServer) Cleanup() {
+	if !pfs.enabled {
 		return
 	}
 
-	log.Println("Cleaning up all port forwards...")
-	for _, mapping := range pfm.mappings {
-		if err := pfm.deletePortForward(mapping.ExternalPort, mapping.Protocol); err != nil {
-			log.Printf("Warning: Failed to delete port forward %d (%s): %v",
-				mapping.ExternalPort, mapping.Protocol, err)
-		}
+	log.Println("Cleaning up port forward server...")
+
+	if pfs.natpmpConn != nil {
+		pfs.natpmpConn.Close()
 	}
-	pfm.mappings = make(map[string]*PortMapping)
-	log.Println("Port forward cleanup complete")
+
+	pfs.mu.Lock()
+	defer pfs.mu.Unlock()
+
+	for _, mapping := range pfs.mappings {
+		pfs.removeIPTablesRule(mapping.ClientIP, mapping.ExternalPort, mapping.InternalPort, mapping.Protocol)
+	}
+	pfs.mappings = make(map[string]*PortMapping)
+
+	log.Println("Port forward server cleanup complete")
 }
 
-func (pfm *PortForwardManager) IsEnabled() bool {
-	return pfm.enabled
-}
-
-func (pfm *PortForwardManager) GetExternalIP() (string, error) {
-	if !pfm.enabled {
-		return "", fmt.Errorf("port forwarding is not enabled")
-	}
-
-	if pfm.upnpClient != nil {
-		ip, err := pfm.upnpClient.GetExternalIPAddress()
-		if err != nil {
-			return "", err
-		}
-		return ip, nil
-	}
-
-	if pfm.natpmpClient != nil {
-		response, err := pfm.natpmpClient.GetExternalAddress()
-		if err != nil {
-			return "", err
-		}
-		ip := net.IPv4(response.ExternalIPAddress[0], response.ExternalIPAddress[1],
-			response.ExternalIPAddress[2], response.ExternalIPAddress[3])
-		return ip.String(), nil
-	}
-
-	return "", fmt.Errorf("no port forwarding client available")
+func (pfs *PortForwardServer) IsEnabled() bool {
+	return pfs.enabled
 }

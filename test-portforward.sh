@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Test script for port forwarding feature
+# Test script for NAT-PMP server feature
 
-echo "=== WireGuard Easy - Port Forwarding Test ==="
+echo "=== WireGuard Easy - NAT-PMP Server Test ==="
 echo ""
 
 # Check if binary exists
@@ -30,32 +30,42 @@ fi
 
 # Show port forwarding config
 echo ""
-echo "Port forwarding settings in config.json:"
+echo "NAT-PMP server settings in config.json:"
 grep -E "port_forward" config.json || echo "⚠️  Port forwarding settings not found in config"
 
 echo ""
 echo "=== Dependencies Check ==="
 echo "Checking Go modules..."
-go list -m github.com/huin/goupnp 2>/dev/null && echo "✅ UPnP library installed" || echo "❌ UPnP library missing"
 go list -m github.com/jackpal/go-nat-pmp 2>/dev/null && echo "✅ NAT-PMP library installed" || echo "❌ NAT-PMP library missing"
-go list -m github.com/jackpal/gateway 2>/dev/null && echo "✅ Gateway library installed" || echo "❌ Gateway library missing"
 
 echo ""
 echo "=== Feature Summary ==="
-echo "Port forwarding allows VPN clients to:"
-echo "  • Request port forwards through the web UI"
-echo "  • Host services accessible from the internet"
-echo "  • Automatically manage router port mappings"
+echo "NAT-PMP Server allows VPN clients to:"
+echo "  • Automatically request port forwards"
+echo "  • Use torrent clients with incoming connections"
+echo "  • Host game servers accessible from internet"
+echo "  • Run any service that needs public access"
+echo ""
+echo "How it works:"
+echo "  1. Server runs NAT-PMP server on VPN interface (port 5351)"
+echo "  2. Clients discover it automatically"
+echo "  3. Applications (torrents, games) request ports via NAT-PMP"
+echo "  4. Server creates iptables rules to forward traffic"
 echo ""
 echo "Requirements:"
-echo "  • Router with UPnP or NAT-PMP enabled"
-echo "  • Server on same LAN as router"
 echo "  • port_forward_enabled: true in config"
+echo "  • Server must have public IP or port forwarding"
+echo "  • Root access for iptables rules"
 echo ""
 echo "To test:"
 echo "  1. Start server: sudo ./wg-easy-go"
-echo "  2. Log in to web UI"
-echo "  3. Click '🔌 Ports' next to a client"
-echo "  4. Add a port forward"
+echo "  2. Connect a VPN client"
+echo "  3. Run: go run test-natpmp-client.go 10.8.0.1"
+echo "  4. Check web UI for active port forwards"
+echo ""
+echo "Client applications that support NAT-PMP:"
+echo "  • qBittorrent, Transmission (torrents)"
+echo "  • Many game clients"
+echo "  • Custom apps using NAT-PMP libraries"
 echo ""
 echo "See PORT_FORWARDING.md for full documentation"

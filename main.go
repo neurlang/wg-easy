@@ -30,15 +30,15 @@ func main() {
 		log.Printf("Make sure WireGuard is installed and you have root privileges")
 	}
 
-	// Initialize port forward manager
-	pfManager := NewPortForwardManager(config)
-	defer pfManager.Cleanup()
+	// Initialize port forward server
+	pfServer := NewPortForwardServer(config)
+	defer pfServer.Cleanup()
 
 	// Link managers
-	wgManager.SetPortForwardManager(pfManager)
+	wgManager.SetPortForwardServer(pfServer)
 
 	// Initialize server
-	server := NewServer(config, wgManager, pfManager)
+	server := NewServer(config, wgManager, pfServer)
 
 	// Setup router
 	r := mux.NewRouter()

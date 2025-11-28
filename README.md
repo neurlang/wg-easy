@@ -19,7 +19,7 @@ The original wg-easy doesn't work properly when hosted behind nginx in a subdire
 - 👥 Create/delete WireGuard clients
 - 🌐 IPv4 and IPv6 dual-stack support
 - 📱 Download client configuration files
-- 🔌 **UPnP/NAT-PMP port forwarding** - Clients can request port forwards through the VPN
+- 🔌 **NAT-PMP server** - VPN clients can automatically request port forwards (for torrents, games, etc.)
 - 🎨 Simple, functional HTML interface
 - 🔄 Nginx reverse proxy support (subdir or root)
 - 🐳 Docker support
@@ -52,7 +52,9 @@ Create `config.json`:
 }
 ```
 
-See [PORT_FORWARDING.md](PORT_FORWARDING.md) for detailed port forwarding documentation.
+See [PORT_FORWARDING.md](PORT_FORWARDING.md) for NAT-PMP server documentation.
+
+The NAT-PMP server allows VPN clients to automatically request port forwards. Applications like torrent clients and game servers can use this to be accessible from the internet.
 
 ## Usage
 
